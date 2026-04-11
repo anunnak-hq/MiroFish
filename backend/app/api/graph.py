@@ -149,64 +149,150 @@ def generate_ontology():
     """
     try:
         logger.info("=== 开始生成本体定义 ===")
-        
-        # 获取参数
-        simulation_requirement = request.form.get('simulation_requirement', '')
-        project_name = request.form.get('project_name', 'Unnamed Project')
-        additional_context = request.form.get('additional_context', '')
-        
-        logger.debug(f"项目名称: {project_name}")
-        logger.debug(f"模拟需求: {simulation_requirement[:100]}...")
-        
-        if not simulation_requirement:
-            return jsonify({
-                "success": False,
-                "error": t('api.requireSimulationRequirement')
-            }), 400
-        
-        # 获取上传的文件
-        uploaded_files = request.files.getlist('files')
-        if not uploaded_files or all(not f.filename for f in uploaded_files):
-            return jsonify({
-                "success": False,
-                "error": t('api.requireFileUpload')
-            }), 400
-        
-        # 创建项目
-        project = ProjectManager.create_project(name=project_name)
-        project.simulation_requirement = simulation_requirement
-        logger.info(f"创建项目: {project.project_id}")
-        
-        # 保存文件并提取文本
-        document_texts = []
-        all_text = ""
-        
-        for file in uploaded_files:
-            if file and file.filename and allowed_file(file.filename):
-                # 保存文件到项目目录
-                file_info = ProjectManager.save_file_to_project(
-                    project.project_id, 
-                    file, 
-                    file.filename
+
+        # --- JSON mode (Anunnak / API clients) ----------------------------
+        # The Anunnak Gosha agent does its own research phase (via web_fetch
+        # and delegate_subtask MCP tools) and assembles a rich brief BEFORE
+        # calling MiroFish. That brief is many KB to several MB of narrative
+        # text spanning market data, competitor profiles, stakeholder
+        # archetypes, etc. It arrives here as a JSON payload:
+        #   {
+        #     "simulation_requirement": "short question",
+        #     "project_name": "anunnak_<ts>",
+        #     "additional_context": "optional metadata or brief summary",
+        #     "documents": [
+        #       {"filename": "industry_overview.md", "text": "..."},
+        #       {"filename": "competitor_snapshot.md", "text": "..."},
+        #       ...
+        #     ]
+        #   }
+        # The ontology extractor needs volume to produce tens or hundreds of
+        # entity types, which in turn drives the agent pool (total_agent_count
+        # = num_entities via simulation_config_generator._parse_time_config).
+        # Prior to this branch, Anunnak callers passed only the short
+        # simulation_requirement as the sole document, starving the extractor
+        # to 1-2 entities and producing a trivial 1-2 agent simulation. This
+        # JSON mode fixes that regression (introduced 2026-04-10 via docker
+        # cp; see anunnak-hq/MiroFish issue tracker).
+        if request.is_json:
+            data = request.get_json() or {}
+            simulation_requirement = data.get('simulation_requirement', '')
+            project_name = data.get('project_name', 'Unnamed Project')
+            additional_context = data.get('additional_context', '')
+            documents = data.get('documents', [])
+
+            logger.info(f"JSON mode: project={project_name} docs={len(documents)} req_len={len(simulation_requirement)}")
+
+            if not simulation_requirement:
+                return jsonify({
+                    "success": False,
+                    "error": t('api.requireSimulationRequirement')
+                }), 400
+
+            if not isinstance(documents, list) or not documents:
+                # Graceful degradation: if no documents array, fall back to
+                # using simulation_requirement as the sole document. Logs a
+                # warning so the Anunnak side can tell its research phase
+                # regressed again.
+                logger.warning(
+                    "JSON mode called without documents[] — falling back to "
+                    "simulation_requirement as single document. This will "
+                    "produce a low-entity-count simulation (1-2 agents). "
+                    "Anunnak research phase should populate documents[]."
                 )
+                documents = [{
+                    "filename": "simulation_requirement.md",
+                    "text": simulation_requirement,
+                }]
+
+            project = ProjectManager.create_project(name=project_name)
+            project.simulation_requirement = simulation_requirement
+            logger.info(f"创建项目 (JSON mode): {project.project_id}")
+
+            document_texts = []
+            all_text = ""
+            for idx, doc in enumerate(documents):
+                if not isinstance(doc, dict):
+                    continue
+                doc_text = str(doc.get('text', '') or '')
+                if not doc_text.strip():
+                    continue
+                doc_text = TextProcessor.preprocess_text(doc_text)
+                doc_filename = str(doc.get('filename', f'document_{idx+1}.md') or f'document_{idx+1}.md')
+                document_texts.append(doc_text)
+                all_text += f"\n\n=== {doc_filename} ===\n{doc_text}"
                 project.files.append({
-                    "filename": file_info["original_filename"],
-                    "size": file_info["size"]
+                    "filename": doc_filename,
+                    "size": len(doc_text),
                 })
-                
-                # 提取文本
-                text = FileParser.extract_text(file_info["path"])
-                text = TextProcessor.preprocess_text(text)
-                document_texts.append(text)
-                all_text += f"\n\n=== {file_info['original_filename']} ===\n{text}"
-        
-        if not document_texts:
-            ProjectManager.delete_project(project.project_id)
-            return jsonify({
-                "success": False,
-                "error": t('api.noDocProcessed')
-            }), 400
-        
+
+            if not document_texts:
+                ProjectManager.delete_project(project.project_id)
+                return jsonify({
+                    "success": False,
+                    "error": "JSON mode called with empty documents[] and no usable text"
+                }), 400
+
+            logger.info(f"JSON mode: loaded {len(document_texts)} document(s), total {len(all_text)} chars")
+
+        # --- Form-data mode (original MiroFish file upload UI) -----------
+        else:
+            simulation_requirement = request.form.get('simulation_requirement', '')
+            project_name = request.form.get('project_name', 'Unnamed Project')
+            additional_context = request.form.get('additional_context', '')
+
+            logger.debug(f"项目名称: {project_name}")
+            logger.debug(f"模拟需求: {simulation_requirement[:100]}...")
+
+            if not simulation_requirement:
+                return jsonify({
+                    "success": False,
+                    "error": t('api.requireSimulationRequirement')
+                }), 400
+
+            # 获取上传的文件
+            uploaded_files = request.files.getlist('files')
+            if not uploaded_files or all(not f.filename for f in uploaded_files):
+                return jsonify({
+                    "success": False,
+                    "error": t('api.requireFileUpload')
+                }), 400
+
+            # 创建项目
+            project = ProjectManager.create_project(name=project_name)
+            project.simulation_requirement = simulation_requirement
+            logger.info(f"创建项目: {project.project_id}")
+
+            # 保存文件并提取文本
+            document_texts = []
+            all_text = ""
+
+            for file in uploaded_files:
+                if file and file.filename and allowed_file(file.filename):
+                    # 保存文件到项目目录
+                    file_info = ProjectManager.save_file_to_project(
+                        project.project_id,
+                        file,
+                        file.filename
+                    )
+                    project.files.append({
+                        "filename": file_info["original_filename"],
+                        "size": file_info["size"]
+                    })
+
+                    # 提取文本
+                    text = FileParser.extract_text(file_info["path"])
+                    text = TextProcessor.preprocess_text(text)
+                    document_texts.append(text)
+                    all_text += f"\n\n=== {file_info['original_filename']} ===\n{text}"
+
+            if not document_texts:
+                ProjectManager.delete_project(project.project_id)
+                return jsonify({
+                    "success": False,
+                    "error": t('api.noDocProcessed')
+                }), 400
+
         # 保存提取的文本
         project.total_text_length = len(all_text)
         ProjectManager.save_extracted_text(project.project_id, all_text)
