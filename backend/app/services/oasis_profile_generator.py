@@ -525,18 +525,24 @@ class OasisProfileGenerator:
         max_attempts = 3
         last_error = None
         
+        # Anthropic compat: strip response_format when base_url is Anthropic
+        # or the Anunnak proxy (both of which reject OpenAI-style JSON mode).
+        _is_anthropic = "anthropic" in (self.base_url or "").lower() or "anunnak.com" in (self.base_url or "").lower()
+
         for attempt in range(max_attempts):
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[
+                _kwargs = {
+                    "model": self.model_name,
+                    "messages": [
                         {"role": "system", "content": self._get_system_prompt(is_individual)},
                         {"role": "user", "content": prompt}
                     ],
-                    response_format={"type": "json_object"},
-                    temperature=0.7 - (attempt * 0.1)  # 每次重试降低温度
+                    "temperature": 0.7 - (attempt * 0.1),  # 每次重试降低温度
                     # 不设置max_tokens，让LLM自由发挥
-                )
+                }
+                if not _is_anthropic:
+                    _kwargs["response_format"] = {"type": "json_object"}
+                response = self.client.chat.completions.create(**_kwargs)
                 
                 content = response.choices[0].message.content
                 

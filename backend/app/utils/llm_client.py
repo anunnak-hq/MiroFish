@@ -11,9 +11,24 @@ from openai import OpenAI
 from ..config import Config
 
 
+def _get_request_model() -> Optional[str]:
+    """Read X-LLM-Model header from current Flask request context (if any).
+
+    Allows Anunnak callers to override the env-level LLM_MODEL_NAME on a
+    per-request basis so the model chosen in the Gosha UI flows through to
+    every internal MiroFish LLM call (ontology extraction, persona
+    generation, report sections, etc.).
+    """
+    try:
+        from flask import request as _req
+        return _req.headers.get('X-LLM-Model')
+    except (ImportError, RuntimeError):
+        return None
+
+
 class LLMClient:
     """LLM客户端"""
-    
+
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -22,11 +37,12 @@ class LLMClient:
     ):
         self.api_key = api_key or Config.LLM_API_KEY
         self.base_url = base_url or Config.LLM_BASE_URL
-        self.model = model or Config.LLM_MODEL_NAME
-        
+        # Priority: explicit arg > X-LLM-Model header > env default.
+        self.model = model or _get_request_model() or Config.LLM_MODEL_NAME
+
         if not self.api_key:
             raise ValueError("LLM_API_KEY 未配置")
-        
+
         self.client = OpenAI(
             api_key=self.api_key,
             base_url=self.base_url
@@ -57,10 +73,16 @@ class LLMClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
-        
-        if response_format:
+
+        # Anthropic /v1/messages does not support OpenAI-style response_format.
+        # When the base URL points at Anthropic (direct or via the Anunnak
+        # proxy which is a drop-in replacement), strip the param — callers
+        # already prompt for JSON output explicitly and the downstream parser
+        # tolerates plain JSON text.
+        is_anthropic = "anthropic" in (self.base_url or "").lower() or "anunnak.com" in (self.base_url or "").lower()
+        if response_format and not is_anthropic:
             kwargs["response_format"] = response_format
-        
+
         response = self.client.chat.completions.create(**kwargs)
         content = response.choices[0].message.content
         # 部分模型（如MiniMax M2.5）会在content中包含<think>思考内容，需要移除
