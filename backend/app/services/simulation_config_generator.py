@@ -17,6 +17,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 
 from openai import OpenAI
+from ..utils.llm_client import LLMClient
 
 from ..config import Config
 from ..utils.logger import get_logger
@@ -234,11 +235,15 @@ class SimulationConfigGenerator:
         
         if not self.api_key:
             raise ValueError("LLM_API_KEY 未配置")
-        
-        self.client = OpenAI(
+
+        # Unified wrapper — routes to anthropic SDK when base_url is Anthropic
+        # or the Anunnak proxy, else falls back to openai SDK (upstream).
+        self.llm = LLMClient(
             api_key=self.api_key,
-            base_url=self.base_url
+            base_url=self.base_url,
+            model=self.model_name,
         )
+        self.client = self.llm.client  # back-compat for code still touching .client
     
     def generate_config(
         self,
@@ -437,31 +442,24 @@ class SimulationConfigGenerator:
         
         max_attempts = 3
         last_error = None
-        
-        # Anthropic compat: strip response_format for Anthropic / Anunnak proxy
-        _is_anthropic = "anthropic" in (self.base_url or "").lower() or "anunnak.com" in (self.base_url or "").lower()
 
         for attempt in range(max_attempts):
             try:
-                _kwargs = {
-                    "model": self.model_name,
-                    "messages": [
+                # Route through unified LLM wrapper — transparently uses
+                # anthropic SDK for Anunnak proxy / Anthropic endpoints.
+                content = self.llm.chat(
+                    messages=[
                         {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt}
+                        {"role": "user", "content": prompt},
                     ],
-                    "temperature": 0.7 - (attempt * 0.1),  # 每次重试降低温度
-                    # 不设置max_tokens，让LLM自由发挥
-                }
-                if not _is_anthropic:
-                    _kwargs["response_format"] = {"type": "json_object"}
-                response = self.client.chat.completions.create(**_kwargs)
-                
-                content = response.choices[0].message.content
-                finish_reason = response.choices[0].finish_reason
-                
-                # 检查是否被截断
-                if finish_reason == 'length':
-                    logger.warning(f"LLM输出被截断 (attempt {attempt+1})")
+                    temperature=0.7 - (attempt * 0.1),  # 每次重试降低温度
+                    max_tokens=4096,
+                    response_format={"type": "json_object"},
+                )
+
+                # Heuristic truncation check (wrapper discards finish_reason)
+                if content and not content.rstrip().endswith(("}", "]")):
+                    logger.warning(f"LLM输出可能被截断 (attempt {attempt+1})")
                     content = self._fix_truncated_json(content)
                 
                 # 尝试解析JSON

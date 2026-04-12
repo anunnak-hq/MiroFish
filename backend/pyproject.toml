@@ -15,6 +15,10 @@ dependencies = [
     
     # LLM 相关
     "openai>=1.0.0",
+    # Anthropic SDK — used when LLM_BASE_URL points at Anthropic or the
+    # Anunnak proxy (which is a drop-in /v1/messages replacement). openai
+    # SDK targets /v1/chat/completions which Anthropic does not accept.
+    "anthropic>=0.40.0",
     
     # Zep Cloud
     "zep-cloud==3.13.0",

@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from openai import OpenAI
+from ..utils.llm_client import LLMClient
 from zep_cloud.client import Zep
 
 from ..config import Config
@@ -192,11 +193,17 @@ class OasisProfileGenerator:
         
         if not self.api_key:
             raise ValueError("LLM_API_KEY 未配置")
-        
-        self.client = OpenAI(
+
+        # Unified wrapper — routes to anthropic SDK when base_url is
+        # Anthropic or the Anunnak proxy, else uses openai SDK upstream.
+        # See backend/app/utils/llm_client.py for the routing logic.
+        self.llm = LLMClient(
             api_key=self.api_key,
-            base_url=self.base_url
+            base_url=self.base_url,
+            model=self.model_name,
         )
+        # Back-compat: some code paths still reference self.client directly.
+        self.client = self.llm.client
         
         # Zep客户端用于检索丰富上下文
         self.zep_api_key = zep_api_key or Config.ZEP_API_KEY
@@ -524,32 +531,30 @@ class OasisProfileGenerator:
         # 尝试多次生成，直到成功或达到最大重试次数
         max_attempts = 3
         last_error = None
-        
-        # Anthropic compat: strip response_format when base_url is Anthropic
-        # or the Anunnak proxy (both of which reject OpenAI-style JSON mode).
-        _is_anthropic = "anthropic" in (self.base_url or "").lower() or "anunnak.com" in (self.base_url or "").lower()
 
         for attempt in range(max_attempts):
             try:
-                _kwargs = {
-                    "model": self.model_name,
-                    "messages": [
+                # Route through the unified LLM wrapper so Anthropic-mode
+                # dispatches to anthropic.Anthropic().messages.create(),
+                # while upstream form-data deployments keep hitting OpenAI.
+                # The wrapper handles system-message extraction, response
+                # shape normalization, and response_format stripping.
+                content = self.llm.chat(
+                    messages=[
                         {"role": "system", "content": self._get_system_prompt(is_individual)},
-                        {"role": "user", "content": prompt}
+                        {"role": "user", "content": prompt},
                     ],
-                    "temperature": 0.7 - (attempt * 0.1),  # 每次重试降低温度
-                    # 不设置max_tokens，让LLM自由发挥
-                }
-                if not _is_anthropic:
-                    _kwargs["response_format"] = {"type": "json_object"}
-                response = self.client.chat.completions.create(**_kwargs)
-                
-                content = response.choices[0].message.content
-                
-                # 检查是否被截断（finish_reason不是'stop'）
-                finish_reason = response.choices[0].finish_reason
-                if finish_reason == 'length':
-                    logger.warning(f"LLM输出被截断 (attempt {attempt+1}), 尝试修复...")
+                    temperature=0.7 - (attempt * 0.1),  # 每次重试降低温度
+                    max_tokens=4096,
+                    response_format={"type": "json_object"},
+                )
+
+                # Truncation detection is best-effort: upstream checked
+                # finish_reason='length' from openai response; the unified
+                # wrapper only returns text, so we fall back to a simple
+                # JSON-completeness heuristic before repair.
+                if content and not content.rstrip().endswith(("}", "]")):
+                    logger.warning(f"LLM输出可能被截断 (attempt {attempt+1}), 尝试修复...")
                     content = self._fix_truncated_json(content)
                 
                 # 尝试解析JSON
