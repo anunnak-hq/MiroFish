@@ -17,7 +17,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 
 from openai import OpenAI
-from ..utils.llm_client import LLMClient
+from ..utils.llm_client import LLMClient, FatalLLMError
 
 from ..config import Config
 from ..utils.logger import get_logger
@@ -475,12 +475,14 @@ class SimulationConfigGenerator:
                     
                     last_error = e
                     
+            except FatalLLMError:
+                raise
             except Exception as e:
                 logger.warning(f"LLM调用失败 (attempt {attempt+1}): {str(e)[:80]}")
                 last_error = e
                 import time
                 time.sleep(2 * (attempt + 1))
-        
+
         raise last_error or Exception("LLM调用失败")
     
     def _fix_truncated_json(self, content: str) -> str:
@@ -593,6 +595,8 @@ class SimulationConfigGenerator:
 
         try:
             return self._call_llm_with_retry(prompt, system_prompt)
+        except FatalLLMError:
+            raise
         except Exception as e:
             logger.warning(f"时间配置LLM生成失败: {e}, 使用默认配置")
             return self._get_default_time_config(num_entities)
@@ -710,6 +714,8 @@ class SimulationConfigGenerator:
 
         try:
             return self._call_llm_with_retry(prompt, system_prompt)
+        except FatalLLMError:
+            raise
         except Exception as e:
             logger.warning(f"事件配置LLM生成失败: {e}, 使用默认配置")
             return {
@@ -875,6 +881,8 @@ class SimulationConfigGenerator:
         try:
             result = self._call_llm_with_retry(prompt, system_prompt)
             llm_configs = {cfg["agent_id"]: cfg for cfg in result.get("agent_configs", [])}
+        except FatalLLMError:
+            raise
         except Exception as e:
             logger.warning(f"Agent配置批次LLM生成失败: {e}, 使用规则生成")
             llm_configs = {}

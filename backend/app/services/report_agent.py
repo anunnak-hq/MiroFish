@@ -19,7 +19,7 @@ from datetime import datetime
 from enum import Enum
 
 from ..config import Config
-from ..utils.llm_client import LLMClient
+from ..utils.llm_client import LLMClient, FatalLLMError
 from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, t
 from .zep_tools import (
@@ -1011,7 +1011,7 @@ class ReportAgent:
                 max_agents = parameters.get("max_agents", 5)
                 if isinstance(max_agents, str):
                     max_agents = int(max_agents)
-                max_agents = min(max_agents, 10)
+                max_agents = min(max_agents, int(os.environ.get('MIROFISH_MAX_INTERVIEW_BATCH', '3')))
                 result = self.zep_tools.interview_agents(
                     simulation_id=self.simulation_id,
                     interview_requirement=interview_topic,
@@ -1057,6 +1057,8 @@ class ReportAgent:
             else:
                 return f"未知工具: {tool_name}。请使用以下工具之一: insight_forge, panorama_search, quick_search"
                 
+        except FatalLLMError:
+            raise
         except Exception as e:
             logger.error(t('report.toolExecFailed', toolName=tool_name, error=str(e)))
             return f"工具执行失败: {str(e)}"
@@ -1205,6 +1207,8 @@ class ReportAgent:
             logger.info(t('report.outlinePlanDone', count=len(sections)))
             return outline
             
+        except FatalLLMError:
+            raise
         except Exception as e:
             logger.error(t('report.outlinePlanFailed', error=str(e)))
             # 返回默认大纲（3个章节，作为fallback）
@@ -1284,7 +1288,7 @@ class ReportAgent:
         
         # ReACT循环
         tool_calls_count = 0
-        max_iterations = 5  # 最大迭代轮数
+        max_iterations = int(os.environ.get('MIROFISH_MAX_REACT_ITER', '3'))
         min_tool_calls = 3  # 最少工具调用次数
         conflict_retries = 0  # 工具调用与Final Answer同时出现的连续冲突次数
         used_tools = set()  # 记录已调用过的工具名

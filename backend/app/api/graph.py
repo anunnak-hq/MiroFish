@@ -14,6 +14,7 @@ from ..services.ontology_generator import OntologyGenerator
 from ..services.graph_builder import GraphBuilderService
 from ..services.text_processor import TextProcessor
 from ..utils.file_parser import FileParser
+from ..utils.llm_client import start_run_budget
 from ..utils.logger import get_logger
 from ..utils.locale import t, get_locale, set_locale
 from ..models.task import TaskManager, TaskStatus
@@ -208,6 +209,10 @@ def generate_ontology():
             project = ProjectManager.create_project(name=project_name)
             project.simulation_requirement = simulation_requirement
             logger.info(f"创建项目 (JSON mode): {project.project_id}")
+
+            cap_usd = float(os.environ.get('MIROFISH_MAX_RUN_COST_USD', '5.0'))
+            max_calls = int(os.environ.get('MIROFISH_MAX_LLM_CALLS_PER_RUN', '50'))
+            start_run_budget(run_id=project.project_id, cap_usd=cap_usd, max_calls=max_calls)
 
             document_texts = []
             all_text = ""

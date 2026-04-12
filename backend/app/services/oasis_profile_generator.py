@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from openai import OpenAI
-from ..utils.llm_client import LLMClient
+from ..utils.llm_client import LLMClient, FatalLLMError
 from zep_cloud.client import Zep
 
 from ..config import Config
@@ -580,12 +580,14 @@ class OasisProfileGenerator:
                     
                     last_error = je
                     
+            except FatalLLMError:
+                raise
             except Exception as e:
                 logger.warning(f"LLM调用失败 (attempt {attempt+1}): {str(e)[:80]}")
                 last_error = e
                 import time
-                time.sleep(1 * (attempt + 1))  # 指数退避
-        
+                time.sleep(1 * (attempt + 1))
+
         logger.warning(f"LLM生成人设失败（{max_attempts}次尝试）: {last_error}, 使用规则生成")
         return self._generate_profile_rule_based(
             entity_name, entity_type, entity_summary, entity_attributes
@@ -947,9 +949,10 @@ class OasisProfileGenerator:
                 
                 return idx, profile, None
                 
+            except FatalLLMError:
+                raise
             except Exception as e:
                 logger.error(f"生成实体 {entity.name} 的人设失败: {str(e)}")
-                # 创建一个基础profile
                 fallback_profile = OasisAgentProfile(
                     user_id=idx,
                     user_name=self._generate_username(entity.name),

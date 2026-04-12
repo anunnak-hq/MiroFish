@@ -17,12 +17,72 @@ openai SDK туда бить не может (он по умолчанию POST'
 что 401/404).
 """
 
+import contextvars
 import json
+import os
 import re
+import time
 from typing import Optional, Dict, Any, List, Tuple
 from openai import OpenAI
 
 from ..config import Config
+from ..utils.logger import get_logger
+
+_budget_logger = get_logger('mirofish.budget')
+
+
+class FatalLLMError(Exception):
+    """Non-retryable LLM error: 402 insufficient_credits, budget exceeded, etc."""
+    pass
+
+
+# ── Per-run budget tracker (ContextVar-scoped) ──────────────────────────
+
+_run_budget: contextvars.ContextVar[Optional['_RunBudget']] = contextvars.ContextVar(
+    'mirofish_run_budget', default=None
+)
+
+
+class _RunBudget:
+    __slots__ = ('cap_usd', 'spend_usd', 'call_count', 'max_calls', 'run_id')
+
+    def __init__(self, run_id: str, cap_usd: float, max_calls: int):
+        self.run_id = run_id
+        self.cap_usd = cap_usd
+        self.max_calls = max_calls
+        self.spend_usd = 0.0
+        self.call_count = 0
+
+
+def start_run_budget(
+    run_id: str,
+    cap_usd: float = 5.0,
+    max_calls: int = 50,
+) -> None:
+    _run_budget.set(_RunBudget(run_id, cap_usd, max_calls))
+    _budget_logger.info(
+        f"budget_start: run={run_id} cap=${cap_usd:.2f} max_calls={max_calls}"
+    )
+
+
+def _track_llm_call(usage_cost_usd: float) -> None:
+    b = _run_budget.get()
+    if b is None:
+        return
+    b.call_count += 1
+    b.spend_usd += usage_cost_usd
+    if b.call_count > b.max_calls:
+        raise FatalLLMError(
+            f"budget_exceeded_calls: run={b.run_id} calls={b.call_count} > max={b.max_calls}"
+        )
+    if b.spend_usd > b.cap_usd:
+        raise FatalLLMError(
+            f"budget_exceeded_usd: run={b.run_id} spend=${b.spend_usd:.4f} > cap=${b.cap_usd:.2f}"
+        )
+
+
+_MAX_429_RETRIES = 3
+_MAX_RETRY_AFTER = 60
 
 
 def _is_anthropic_base_url(base_url: Optional[str]) -> bool:
@@ -166,15 +226,18 @@ class LLMClient:
                 kwargs["system"] = system_text
             if temperature is not None:
                 kwargs["temperature"] = temperature
-            response = self.anthropic_client.messages.create(**kwargs)  # type: ignore[union-attr]
-            # Anthropic returns content as a list of blocks. Concatenate
-            # text blocks in order and discard non-text blocks.
+
+            response = self._call_anthropic_with_breaker(kwargs)
+
             parts: List[str] = []
             for block in (response.content or []):
                 text_attr = getattr(block, "text", None)
                 if text_attr:
                     parts.append(text_attr)
             content = "".join(parts)
+
+            # Cost tracking
+            self._track_usage_anthropic(response)
         else:
             kwargs = {
                 "model": self.model,
@@ -184,10 +247,98 @@ class LLMClient:
             }
             if response_format:
                 kwargs["response_format"] = response_format
-            response = self.openai_client.chat.completions.create(**kwargs)  # type: ignore[union-attr]
+
+            response = self._call_openai_with_breaker(kwargs)
             content = response.choices[0].message.content or ""
 
+            # Cost tracking
+            self._track_usage_openai(response)
+
         return _strip_think_tags(content)
+
+    # ── Circuit breaker helpers ───────────────────────────────────────
+
+    def _call_anthropic_with_breaker(self, kwargs: Dict[str, Any]) -> Any:
+        import anthropic as _anth  # type: ignore
+        for attempt in range(_MAX_429_RETRIES + 1):
+            try:
+                return self.anthropic_client.messages.create(**kwargs)  # type: ignore[union-attr]
+            except _anth.APIStatusError as e:
+                status = getattr(e, 'status_code', 0)
+                if status == 402 or 'insufficient_credits' in str(e).lower():
+                    raise FatalLLMError(f"insufficient_credits (anthropic 402): {e}") from e
+                if status == 429:
+                    if attempt >= _MAX_429_RETRIES:
+                        raise FatalLLMError(
+                            f"rate_limit_exhausted: {_MAX_429_RETRIES + 1} attempts failed: {e}"
+                        ) from e
+                    retry_after = min(
+                        _MAX_RETRY_AFTER,
+                        int(getattr(e, 'response', None) and
+                            e.response.headers.get('retry-after', '10') or '10')
+                    )
+                    _budget_logger.warning(
+                        f"429 rate_limited (attempt {attempt + 1}), sleeping {retry_after}s"
+                    )
+                    time.sleep(retry_after)
+                    continue
+                raise
+            except _anth.APIConnectionError:
+                raise
+
+    def _call_openai_with_breaker(self, kwargs: Dict[str, Any]) -> Any:
+        from openai import APIStatusError as _OAIStatus
+        for attempt in range(_MAX_429_RETRIES + 1):
+            try:
+                return self.openai_client.chat.completions.create(**kwargs)  # type: ignore[union-attr]
+            except _OAIStatus as e:
+                status = getattr(e, 'status_code', 0)
+                if status == 402 or 'insufficient_credits' in str(e).lower():
+                    raise FatalLLMError(f"insufficient_credits (openai 402): {e}") from e
+                if status == 429:
+                    if attempt >= _MAX_429_RETRIES:
+                        raise FatalLLMError(
+                            f"rate_limit_exhausted: {_MAX_429_RETRIES + 1} attempts failed: {e}"
+                        ) from e
+                    retry_after = min(
+                        _MAX_RETRY_AFTER,
+                        int(getattr(e, 'response', None) and
+                            e.response.headers.get('retry-after', '10') or '10')
+                    )
+                    _budget_logger.warning(
+                        f"429 rate_limited (attempt {attempt + 1}), sleeping {retry_after}s"
+                    )
+                    time.sleep(retry_after)
+                    continue
+                raise
+
+    @staticmethod
+    def _track_usage_anthropic(response: Any) -> None:
+        try:
+            usage = getattr(response, 'usage', None)
+            if usage:
+                in_tok = getattr(usage, 'input_tokens', 0) or 0
+                out_tok = getattr(usage, 'output_tokens', 0) or 0
+                cost_usd = (in_tok * 0.80 + out_tok * 4.0) / 1_000_000
+                _track_llm_call(cost_usd)
+        except FatalLLMError:
+            raise
+        except Exception:
+            pass
+
+    @staticmethod
+    def _track_usage_openai(response: Any) -> None:
+        try:
+            usage = getattr(response, 'usage', None)
+            if usage:
+                in_tok = getattr(usage, 'prompt_tokens', 0) or 0
+                out_tok = getattr(usage, 'completion_tokens', 0) or 0
+                cost_usd = (in_tok * 0.80 + out_tok * 4.0) / 1_000_000
+                _track_llm_call(cost_usd)
+        except FatalLLMError:
+            raise
+        except Exception:
+            pass
 
     def chat_json(
         self,
