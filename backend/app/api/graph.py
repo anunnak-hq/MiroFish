@@ -210,7 +210,8 @@ def generate_ontology():
             project.simulation_requirement = simulation_requirement
             logger.info(f"创建项目 (JSON mode): {project.project_id}")
 
-            cap_usd = float(os.environ.get('MIROFISH_MAX_RUN_COST_USD', '5.0'))
+            header_cap = request.headers.get('X-Run-Budget-Cap-USD')
+            cap_usd = float(header_cap) if header_cap else float(os.environ.get('MIROFISH_MAX_RUN_COST_USD', '5.0'))
             max_calls = int(os.environ.get('MIROFISH_MAX_LLM_CALLS_PER_RUN', '50'))
             start_run_budget(run_id=project.project_id, cap_usd=cap_usd, max_calls=max_calls)
 
