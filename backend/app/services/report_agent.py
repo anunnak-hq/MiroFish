@@ -22,6 +22,7 @@ from ..config import Config
 from ..utils.llm_client import LLMClient, FatalLLMError
 from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, t
+from ..utils.react_sanitizer import sanitize_react_output
 from .zep_tools import (
     ZepToolsService, 
     SearchResult, 
@@ -2151,7 +2152,8 @@ class ReportManager:
         
         if not content:
             return content
-        
+
+        content = sanitize_react_output(content)
         content = content.strip()
         lines = content.split('\n')
         cleaned_lines = []
