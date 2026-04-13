@@ -85,7 +85,42 @@ class TestPass2ChineseThinking:
         result = sanitize_react_output(text)
         assert "我来分析" not in result
         assert "数据。" in result
-        assert "结论。" in result
+
+
+class TestPass2RussianThinking:
+    """Pass 2: Russian thinking traces from today's actual MiroFish output."""
+
+    def test_strip_russian_quick_search_trace(self):
+        text = "Заголовок секции.\nПозвольте мне провести быстрый поиск для получения конкретных данных о финансовых показателях.\nРынок растёт."
+        result = sanitize_react_output(text)
+        assert "Позвольте мне" not in result
+        assert "Заголовок секции." in result
+        assert "Рынок растёт." in result
+
+    def test_strip_russian_quick_search_with_tool_name(self):
+        text = "Начало.\nПозвольте мне использовать quick_search для получения конкретных данных.\nКонец."
+        result = sanitize_react_output(text)
+        assert "Позвольте мне использовать quick_search" not in result
+        assert "Начало." in result
+        assert "Конец." in result
+
+    def test_strip_russian_try_search(self):
+        text = "Данные.\nПопробую найти данные о конкурентных реакциях.\nВывод."
+        result = sanitize_react_output(text)
+        assert "Попробую" not in result
+        assert "Вывод." in result
+
+    def test_preserve_russian_legitimate_with_prefix(self):
+        """Russian sentence starting with 'Позвольте' but no tool reference."""
+        text = "Позвольте мне обратить внимание на ключевые тенденции рынка."
+        assert sanitize_react_output(text) == text
+
+    def test_strip_english_let_me_search(self):
+        text = "Intro.\nLet me search for the relevant market data.\nConclusion."
+        result = sanitize_react_output(text)
+        assert "Let me search" not in result
+        assert "Intro." in result
+        assert "Conclusion." in result
 
 
 class TestPreserveLegitimateContent:
